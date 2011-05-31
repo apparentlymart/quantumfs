@@ -45,16 +45,27 @@ use Fuse;
 use Git::PurePerl;
 use POSIX qw(ENOENT EISDIR EROFS ENOTDIR EBUSY EINVAL O_WRONLY O_RDWR);
 use Fcntl qw(S_IFREG S_IFDIR S_IFLNK);
+use DateTime;
 
 my $repodir;
+my $headname;
 my $ref_path;
 my $mountpoint;
 my $repo;
+# Buffers for open files, so we won't need to
+# keep rewriting the whole tree with each
+# individual write.
+my %bufs = ();
+# Number of times each path has been open,
+# so we can throw away our buffer when
+# callers are finished with it.
+my %openct = ();
 
 sub run {
     my ($class, $new_repodir, $new_headname, $new_mountpoint) = @_;
 
     $repodir = $new_repodir;
+    $headname = $new_headname;
     $ref_path = 'refs/heads/'.$new_headname;
     $mountpoint = $new_mountpoint;
 
@@ -96,7 +107,7 @@ sub resolve_path {
     my $err = sub {
 	my $err = shift;
 	warn "$err\n";
-	return wantarray ? (undef, \@stack) : undef;
+	return wantarray ? (undef, reverse @stack) : undef;
     };
 
     my $commit = $repo->ref($ref_path);
@@ -131,7 +142,106 @@ sub resolve_path {
 	}
     }
 
-    return wantarray ? ($current, \@stack) : $current;
+    return wantarray ? ($current, reverse @stack) : $current;
+}
+
+sub write_dir_entry {
+    my ($path, %params) = @_;
+
+    my @parts = resolve_path($path);
+    my @backchunks = reverse(split(m!/!, $path));
+
+    # If there aren't the right amount of @parts then
+    # some parent trees are missing, so don't try to
+    # write this thing.
+    return undef if @parts != @backchunks;
+
+    my $new_entry = Git::PurePerl::NewDirectoryEntry->new(
+	filename => $backchunks[0],
+	%params,
+    );
+
+    my $chunks = scalar(@parts);
+
+    my $last_tree;
+
+    for (my $i = 0; $i < ($chunks - 1); $i++) {
+	my $part = $parts[$i];
+	my $chunk = $backchunks[$i];
+	my $next_part = $parts[$i + 1];
+	my $next_chunk = $backchunks[$i + 1];
+
+	# If $part is undef then we're creating a new
+	# entry in the tree. Otherwise, we're rewriting
+	# an existing one.
+	my @new_entries = ();
+	if (defined($part)) {
+	    foreach my $entry ($next_part->object->directory_entries) {
+		if ($entry->filename eq $chunk) {
+		    push @new_entries, $new_entry;
+		}
+		else {
+		    push @new_entries, Git::PurePerl::NewDirectoryEntry->new(
+                        filename => $entry->filename,
+                        mode => $entry->mode,
+                        sha1 => $entry->sha1,
+                    );
+		}
+	    }
+	}
+	else {
+	    foreach my $entry ($next_part->object->directory_entries) {
+		push @new_entries, Git::PurePerl::NewDirectoryEntry->new(
+                    filename => $entry->filename,
+                    mode => $entry->mode,
+                    sha1 => $entry->sha1,
+                );
+	    }
+	    push @new_entries, $new_entry;
+	}
+
+	$last_tree = Git::PurePerl::NewObject::Tree->new(
+            directory_entries => \@new_entries,
+        );
+	$repo->put_object($last_tree);
+	$new_entry = Git::PurePerl::NewDirectoryEntry->new(
+	    filename => $next_chunk,
+	    mode => 40000,
+	    sha1 => $last_tree->sha1,
+	);
+    }
+
+    return $last_tree;
+}
+
+sub update_ref {
+    my ($new_tree) = @_;
+
+    my $author = Git::PurePerl::Actor->new(
+	name => ".",
+	email => ".",
+    );
+    my $now = DateTime->now();
+
+    my $old_commit = $repo->ref($ref_path);
+    unless ($old_commit) {
+	warn "Missing ref $ref_path\n";
+	return;
+    }
+
+    my $new_commit = Git::PurePerl::NewObject::Commit->new(
+	tree => $new_tree->sha1,
+	parent => $old_commit->sha1,
+	author => $author,
+	authored_time => $now,
+	committer => $author,
+	committed_time => $now,
+	comment => ".",
+    );
+
+    $repo->put_object( $new_commit );
+    $repo->update_ref( $headname, $new_commit->sha1 );
+
 }
 
 sub getdir {
@@ -162,6 +272,8 @@ sub getattr {
     my $entry = resolve_path($path);
     return -ENOENT unless $entry;
 
+    warn "getattr for $path yielded ".$entry->sha1;
+
     my $now = time();
 
     return (
@@ -190,17 +302,109 @@ sub open {
     return -EISDIR if $kind eq 'tree';
     return -EINVAL unless $kind eq 'blob';
 
+    $bufs{$path} = \($entry->object->content);
+    $openct{$path}++;
+
     return 0;
+}
+
+sub mknod {
+    my ($path) = @_;
+
+    my @parts = split(m!/!, $path);
+    pop @parts;
+    my $dir = join('/', @parts);
+
+    if ($dir) {
+	my $entry = resolve_path($dir);
+	return -ENOENT unless $entry;
+	return -ENOTDIR unless $entry->object->kind eq 'tree';
+    }
+
+    # Prepare a buffer for this new file
+    # ready to be written to.
+    my $buf = "";
+    $openct{$path}++;
+    $bufs{$path} = \$buf;
+
+    return 0;    
+}
+
+sub release {
+    my ($path) = @_;
+
+    my $entry = resolve_path($path);
+    return -ENOENT unless $entry;
+    my $kind = $entry->object->kind;
+    return -EISDIR if $kind eq 'tree';
+    return -EINVAL unless $kind eq 'blob';
+
+    if ((--$openct{$path}) < 1) {
+	delete $bufs{$path};
+	delete $openct{$path};
+    }
 }
 
 sub read {
     my ($path, $size, $offset) = @_;
 
-    my $entry = resolve_path($path);
-    return -ENOENT unless $entry;
-    return -EINVAL unless $entry->object->kind eq 'blob';
-
-    my $content = $entry->object->content;
-
-    return substr($content, $offset, $size);
+    if (exists $bufs{$path}) {
+	my $buf_ref = $bufs{$path};
+	return substr($$buf_ref, $offset, $size);
+    }
+    else {
+	# If there's no buffer then somehow
+	# we're servicing a read without
+	# a prior open, which is not supported.
+	return -EBUSY;
+    }
 }
+
+sub write {
+    my ($path, $new_buf, $offset) = @_;
+
+    if (exists $bufs{$path}) {
+	my $buf_ref = $bufs{$path};
+	my $size = length($new_buf);
+	substr($$buf_ref, $offset, $size) = $new_buf;
+    }
+    else {
+	# If there's no buffer then somehow
+	# we're servicing a write without
+	# a prior open, which is not supported.
+	return -EBUSY;
+    }
+}
+
+sub mkdir {
+    my ($path) = @_;
+
+    my $new_tree = Git::PurePerl::NewObject::Tree->new(
+	directory_entries => [],
+    );
+    $repo->put_object($new_tree);
+
+    my $root_tree = write_dir_entry($path,
+        mode => 40000,
+        sha1 => $new_tree->sha1,
+    );
+
+    update_ref($root_tree);
+
+    return 0;
+}
+
+# HACK: Override this so that an empty directory will
+# yield an empty content, not undef.
+sub Git::PurePerl::NewObject::Tree::_build_content {
+    my $self = shift;
+    my $content = '';
+    foreach my $de ( $self->directory_entries ) {
+        $content
+            .= $de->mode . ' '
+            . $de->filename . "\0"
+            . pack( 'H*', $de->sha1 );
+    }
+    $self->content($content);
+}
+
